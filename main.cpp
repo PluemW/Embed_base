@@ -1,68 +1,157 @@
-// #include <SD.h>                      // need to include the SD library
-// //#define SD_ChipSelectPin 53  //example uses hardware SS pin 53 on Mega2560
-// #define SD_ChipSelectPin 53  //using digital pin 4 on arduino nano 328, can use other pins
-// #include <TMRpcm.h>           //  also need to include this library...
-// #include <SPI.h>
-// #include <Tone.h>
-
-
-// TMRpcm tmrpcm;   // create an object for use in this sketch
-// File myFile;
-// Tone notePlayer[2];
-
-
-// void setup(){
-
-//   // myFile = SD.open("2");
-//   tmrpcm.speakerPin = 47; //5,6,11 or 46 on Mega, 9 on Uno, Nano, etc
-//     // notePlayer[0].begin(46);
-
-//   Serial.begin(9600);
-//   if (!SD.begin(SD_ChipSelectPin)) {  // see if the card is present and can be initialized:
-//     Serial.println("SD fail");  
-//     return;   // don't do anything more if not
-//   }
-// }
-
-
-
-// void loop(){  
-//   // notePlayer[0].play(myFile);
-//   tmrpcm.setVolume(10);
-//   tmrpcm.play("2.wav");
-//   Serial.println("123");
-// }
-// Duelling Tones - Simultaneous tone generation.
-// To mix the output of the signals to output to a small speaker (i.e. 8 Ohms or higher),
-// simply use 1K Ohm resistors from each output pin and tie them together at the speaker.
-// Don't forget to connect the other side of the speaker to ground!
-
-// This example plays notes 'a' through 'g' sent over the Serial Monitor.
-// 's' stops the current playing tone.  Use uppercase letters for the second.
-
-#include <Tone.h>
 #include <Arduino.h>
-int notes[] = { NOTE_A3,
-                NOTE_B3,
-                NOTE_C4,
-                NOTE_D4,
-                NOTE_E4,
-                NOTE_F4,
-                NOTE_G4 };
+#include <LiquidCrystal_I2C.h>
+#include "SimpleKalmanFilter.h"
+#include <MQTT.h>
+#include <WiFi.h>
 
-// You can declare the tones as an array
-Tone notePlayer[2];
+#define Button_Pin   13
+#define Vol     34
+boolean sent = false;
+boolean wait = false;
+String msg;
 
-void setup(void)
-{
-  // Serial.begin(9600);
-  notePlayer[0].begin(47);
-  notePlayer[1].begin(12);
+SimpleKalmanFilter simple(2, 2, 0.01);
+LiquidCrystal_I2C lcd(0x27, 16, 2); // set up LCD-I2C 16 Col 2 Row
+WiFiClient net;
+MQTTClient client;
+MQTTClient client1;
+
+// Config wifi path
+const char ssid[] = "@JumboPlusIoT";
+const char pass[] = "12345678";
+
+// Config sever path
+const char mqtt_broker[]="test.mosquitto.org";
+const char mqtt_topic[]="project1.21/height";
+const char mqtt_sub[]="project1.21/distance";
+const char mqtt_client_id[]="arduino_project_1.21"; // must change this string to a unique value
+int MQTT_PORT=1883;
+
+// Function Topic
+void connect();
+void messageReceived(String &topic, String &payload);
+void task_arduino(void *arg);
+
+void setup(){
+  Serial.begin(9600);
+  pinMode(Vol,INPUT);
+  pinMode(Button_Pin,INPUT);
+	lcd.init();
+	lcd.backlight();
+  WiFi.begin(ssid, pass);
+  client.begin(mqtt_broker, MQTT_PORT, net);
+  client.onMessage(messageReceived);
+  connect();
+  xTaskCreatePinnedToCore(
+      task_arduino,
+      "Task1",
+      8192,
+      NULL,
+      0,
+      NULL,
+      0);
 }
 
-void loop(void)
-{
-  char c='g';
-        notePlayer[0].play(notes[c - 'a']);
+void loop(){
+  client.loop();
+  if(!client.connected()){
+    connect();
+  }
+  // Interface running
+  if(!sent && !wait){
+    lcd.setCursor(3,0);
+    lcd.print("PID Tuning");
+    lcd.setCursor(0,1);
+    lcd.print("Height(cm): ");
+    lcd.setCursor(12,1);
+    lcd.print(String(int(simple.updateEstimate(map(analogRead(Vol), 0, 4095, 0, 80)))));
+  }
+  if(wait){
+    lcd.setCursor(0,0);
+    lcd.print("Tuning(cm): "+msg);
+    lcd.setCursor(0,1);
+    lcd.print("Height(cm): "+String(int(simple.updateEstimate(map(analogRead(Vol), 0, 4095, 0, 80)))));
+  }
+  delay(400);
+  lcd.clear();
+}
 
+// Function detail
+void connect()
+{
+  // Connect Wifi screen
+  int i = 0;
+  if(WiFi.status() == WL_CONNECTED){
+    lcd.clear();
+    i = 0;
+    lcd.setCursor(1,0);
+    lcd.print("Connected WIFI");
+    delay(500);
+    lcd.clear();
+  }
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    lcd.setCursor(1,0);
+    lcd.print("ConnectingWIFI");
+    lcd.setCursor(i,1);
+    lcd.print(".");
+    i++;
+    if(i>15){
+      i = 0;
+      lcd.clear();
+    }
+    delay(1000);
+  }
+  // Connect client
+  if(client.connect(mqtt_client_id)){
+    lcd.clear();
+    i = 0;
+    lcd.setCursor(0,0);
+    lcd.print("Connected Client");
+    delay(500);
+    lcd.clear();
+  }
+  while (!client.connect(mqtt_client_id))
+  {
+    lcd.setCursor(0,0);
+    lcd.print("ConnectingClient");
+    lcd.setCursor(i,1);
+    lcd.print(".");
+    i++;
+    if(i>15){
+      i = 0;
+      lcd.clear();
+    }
+    delay(1000);
+  }
+  client.subscribe(mqtt_sub);
+}
+
+void messageReceived(String &topic, String &payload)
+{
+  Serial.println(payload);
+  if(payload==msg){
+    lcd.clear();
+    lcd.setCursor(6,1);
+    lcd.print("Done");
+    delay(1000);
+    wait = false;
+  }
+}
+
+void task_arduino(void *arg)
+{
+  while (1)
+  {
+    Serial.println(digitalRead(Button_Pin));
+    if(digitalRead(Button_Pin) && !sent && !wait){
+      sent = true;
+      msg = String(int(simple.updateEstimate(map(analogRead(Vol), 0, 4095, 0, 80))));
+    }
+    if(sent){
+      client.publish(mqtt_topic, msg);
+      sent = false;
+      wait = true;
+    }
+  }
 }
